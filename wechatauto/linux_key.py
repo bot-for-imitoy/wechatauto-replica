@@ -44,6 +44,7 @@ from wechatauto.db import (
     CONFIG_CIPHER_NAME,
     IS_WINDOWS,
     PAGE_SZ,
+    _pbkdf2,
     _verify_enc_key,
 )
 
@@ -52,6 +53,9 @@ WECHAT_PROC_NAMES = {"wechat", "weixin", "weixin.exe", "wechatapp"}
 
 # 锚点扫描窗口（锚点前后各 128KB 足够覆盖相邻堆块里的配置对象）
 ANCHOR_WINDOW = 0x20000
+
+# 主密钥 → 逐库密钥 的 PBKDF2 迭代数（微信魔改 WCDB，与 db.WeChatDB.KDF_ITER 一致）
+KDF_ITER = 256000
 
 Chunk = Tuple[int, bytes]  # (起始地址, 内容)
 
@@ -257,6 +261,100 @@ def scan_pid_keys(
         return found
 
 
+# ---------------------------------------------------------------------------
+# 主密钥假设（H3）：微信 4.x 内存里驻留的是主密钥，逐库密钥 =
+# PBKDF2-SHA512(主密钥, 库 salt, 256000) 派生，派生结果不一定以裸密钥形式
+# 留在内存里——所以阶段 1/2 的「直接验证」可能全军覆没。这里对锚点窗口内
+# 的候选先派生再验证。每个候选 ~60-200ms，用线程池并行
+# （hashlib.pbkdf2_hmac 释放 GIL，线程即真实并行）。
+# ---------------------------------------------------------------------------
+def derive_keys_from_master(master: bytes, db_files: Sequence[Tuple[str, str, int]]) -> Dict[str, bytes]:
+    """主密钥 → 逐库派生密钥，仅返回通过页 1 HMAC 校验的库。"""
+    keys: Dict[str, bytes] = {}
+    for rel, path, _ in db_files:
+        try:
+            with open(path, "rb") as f:
+                page1 = f.read(PAGE_SZ)
+        except OSError:
+            continue
+        if len(page1) < PAGE_SZ:
+            continue
+        derived = _pbkdf2(master, page1[:16], KDF_ITER)
+        if _verify_enc_key(derived, page1):
+            keys[rel] = derived
+    return keys
+
+
+def scan_pid_master(
+    pid: int,
+    db_files: Sequence[Tuple[str, str, int]],
+    anchor_window: int = ANCHOR_WINDOW,
+    workers: Optional[int] = None,
+    max_candidates: int = 200000,
+    progress=None,
+) -> Optional[str]:
+    """扫描进程内存中的 32 字节主密钥（锚点窗口 + PBKDF2 派生验证）。
+
+    返回主密钥 hex 或 None。用第一个可读库做初筛，命中后由调用方对全部
+    库做派生（derive_keys_from_master）。
+    """
+    page1s = _load_page1s(db_files)
+    if not page1s:
+        raise RuntimeError("没有任何可读的 .db 文件（未登录或数据目录不对）")
+    rel0, page1_0 = page1s[0]
+
+    if workers is None:
+        workers = max(1, (os.cpu_count() or 2) - 1)
+
+    regions = _parse_maps(pid)
+    candidates: List[bytes] = []
+    seen: set = set()
+    truncated = False
+    with open(f"/proc/{pid}/mem", "rb", buffering=0) as mem:
+        for start, end in ((s, e) for s, e, _p, _w in regions):
+            buf = _read_mem(mem, start, end - start)
+            if not buf:
+                continue
+            pos = 0
+            while True:
+                pos = buf.find(CONFIG_CIPHER_NAME, pos)
+                if pos < 0:
+                    break
+                lo = max(0, pos - anchor_window)
+                hi = min(len(buf), pos + len(CONFIG_CIPHER_NAME) + anchor_window)
+                for off in range(lo, max(lo, hi - 32)):
+                    cand = buf[off:off + 32]
+                    if cand not in seen and len(set(cand)) >= 15:
+                        seen.add(cand)
+                        candidates.append(cand)
+                pos += len(CONFIG_CIPHER_NAME)
+                if len(candidates) >= max_candidates:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+    if progress:
+        progress("master", len(candidates), len(candidates))
+    if truncated:
+        sys.stderr.write(f"[wechatauto] 主密钥候选达到上限 {max_candidates}，已截断"
+                         "（可加 --anchor-window 收窄或 --max-master 放宽）\n")
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _test(cand: bytes) -> Optional[str]:
+        derived = _pbkdf2(cand, page1_0[:16], KDF_ITER)
+        if _verify_enc_key(derived, page1_0):
+            return cand.hex()
+        return None
+
+    with ThreadPoolExecutor(workers) as pool:
+        for res in pool.map(_test, candidates, chunksize=8):
+            if res:
+                return res
+    return None
+
+
 def extract_keys_for_dbs(
     db_files: Sequence[Tuple[str, str, int]],
     pids: Optional[Sequence[int]] = None,
@@ -280,6 +378,17 @@ def extract_keys_for_dbs(
             raise
         if len(collected) >= len(db_files):
             break
+    if not collected:
+        # 直接验证落空 → 主密钥假设
+        for pid in pids:
+            try:
+                master_hex = scan_pid_master(pid, db_files)
+            except (PermissionError, RuntimeError, OSError):
+                continue
+            if master_hex:
+                collected = derive_keys_from_master(
+                    bytes.fromhex(master_hex), db_files)
+                break
     if not collected:
         sys.stderr.write(_ROOT_HINT + "\n")
     return collected
@@ -384,6 +493,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="指定微信进程 pid（默认自动枚举），可多次")
     ap.add_argument("--deep", action="store_true",
                     help="锚点扫描失败后追加堆/匿名区全量滑窗（慢，分钟级）")
+    ap.add_argument("--anchor-window", type=int, default=ANCHOR_WINDOW,
+                    help=f"主密钥假设的锚点窗口半径（默认 {ANCHOR_WINDOW} 字节）")
+    ap.add_argument("--max-master", type=int, default=200000,
+                    help="主密钥候选上限（默认 200000）")
     ap.add_argument("--watch", type=int, metavar="SECONDS", default=0,
                     help="每 N 秒重扫一次（兜底用途；密钥是静态值，正常无需开启）")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出结果")
@@ -411,6 +524,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if stage == "deep":
             print("[wechatauto] 锚点扫描未命中，转入堆/匿名区深度扫描（较慢）...",
                   file=sys.stderr)
+        elif stage == "master":
+            est = done * 0.1 / max(1, (os.cpu_count() or 2) - 1) / 60
+            print(f"[wechatauto] 转入主密钥假设验证：{done} 个候选 × PBKDF2×{KDF_ITER}"
+                  f"（预计 ~{est:.0f} 分钟）...", file=sys.stderr)
 
     pids = args.pid or find_wechat_pids()
     if not pids:
@@ -433,6 +550,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     sys.stderr.write(f"[wechatauto] pid {pid} 扫描失败: {exc!r}\n")
                 if len(keys) >= len(db_files):
                     break
+
+            # 阶段 3：直接验证全部落空 → 主密钥假设（内存里是主密钥，
+            # 逐库密钥 = PBKDF2(主密钥, 库salt, 256000)，须派生后验证）
+            if not keys:
+                for pid in pids:
+                    try:
+                        master_hex = scan_pid_master(
+                            pid, db_files, anchor_window=args.anchor_window,
+                            max_candidates=args.max_master, progress=progress)
+                    except (RuntimeError, OSError) as exc:
+                        sys.stderr.write(f"[wechatauto] pid {pid} 主密钥扫描失败: {exc!r}\n")
+                        continue
+                    if master_hex:
+                        print(f"[wechatauto] 找到主密钥: {master_hex}", file=sys.stderr)
+                        keys = derive_keys_from_master(
+                            bytes.fromhex(master_hex), db_files)
+                        break
+                    print(f"[wechatauto] pid {pid} 主密钥未命中", file=sys.stderr)
+
             results[account] = (keys, db_files)
 
         if args.json:
@@ -457,9 +593,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.watch:
                 return 0
         else:
-            print("[wechatauto] 未找到任何密钥。建议：① 确认微信已登录；"
-                  "② 加 --deep 重试；③ 微信版本过新时锚点可能漂移，"
-                  "欢迎到上游项目提 issue 附 probe 输出。", file=sys.stderr)
+            print("[wechatauto] 未找到任何密钥。建议：\n"
+                  "  ① 确认微信已登录，且扫的是【持有打开 .db 文件】的进程\n"
+                  "     （可用 tools/probe_memory.py 查看谁打开了库文件）；\n"
+                  "  ② 跑诊断：sudo python3 tools/probe_memory.py，把完整输出发回；\n"
+                  "  ③ --anchor-window 放宽主密钥窗口（如 262144）后重试。",
+                  file=sys.stderr)
             if not args.watch:
                 return 3
         time.sleep(args.watch)
