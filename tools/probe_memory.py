@@ -50,26 +50,38 @@ def head(title: str) -> None:
 # H0: 库文件状态
 # ---------------------------------------------------------------------------
 def check_db_files(db_dir: str):
-    _, db_files = collect_db_files(db_dir)
-    log(f"共 {len(db_files)} 个库文件")
+    """兼容两种传法：账号目录的父目录，或账号目录本身。"""
+    accounts = collect_db_files(db_dir)
+    if not accounts and os.path.isdir(os.path.join(db_dir, "db_storage")):
+        # 用户直接传了账号目录
+        files = []
+        base = os.path.join(db_dir, "db_storage")
+        for root, _, names in os.walk(base):
+            for name in names:
+                if name.endswith(".db") and not name.endswith(("-wal", "-shm")):
+                    p = os.path.join(root, name)
+                    files.append((os.path.relpath(p, base), p, os.path.getsize(p)))
+        accounts = [(os.path.basename(os.path.normpath(db_dir)), files)]
+
     plaintext, usable = [], []
-    for rel, path, size in db_files[:40]:
-        try:
-            with open(path, "rb") as f:
-                page1 = f.read(PAGE_SZ)
-        except OSError as exc:
-            log(f"  [不可读] {rel}: {exc}")
-            continue
-        magic = page1[:16]
-        if magic == b"SQLite format 3\x00":
-            plaintext.append(rel)
-            log(f"  [明文SQLite!] {rel} ({size} B) —— 未加密，无需密钥可直接读")
-            continue
-        if len(page1) < PAGE_SZ:
-            log(f"  [过小] {rel}: {size} B")
-            continue
-        usable.append((rel, path, size))
-        log(f"  [加密库] {rel} ({size} B)  page1[0:32]={page1[:32].hex()}")
+    for account, db_files in accounts:
+        log(f"账号 {account}：{len(db_files)} 个库文件")
+        for rel, path, size in db_files[:40]:
+            try:
+                with open(path, "rb") as f:
+                    page1 = f.read(PAGE_SZ)
+            except OSError as exc:
+                log(f"  [不可读] {rel}: {exc}")
+                continue
+            if page1[:16] == b"SQLite format 3\x00":
+                plaintext.append(f"{account}/{rel}")
+                log(f"  [明文SQLite!] {rel} ({size} B) —— 未加密，无需密钥可直接读")
+                continue
+            if len(page1) < PAGE_SZ:
+                log(f"  [过小] {rel}: {size} B")
+                continue
+            usable.append((f"{account}/{rel}", path, size))
+            log(f"  [加密库] {rel} ({size} B)  page1[0:32]={page1[:32].hex()}")
     return plaintext, usable
 
 
@@ -285,6 +297,13 @@ def dump_anchor_context(pid: int, before: int = 128, after: int = 192):
 
 # ---------------------------------------------------------------------------
 def main():
+    # sudo 下 locale 常被重置成 POSIX，强制 UTF-8 输出避免中文变 ???
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db-dir", help="账号数据目录（含 db_storage 的目录）")

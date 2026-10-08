@@ -3217,6 +3217,7 @@ def auto_detect_db_dir() -> Optional[str]:
             os.path.join(home, ".xwechat_files"),
             os.path.join(home, ".var", "app", "com.tencent.WeChat", "xwechat_files"),
             os.path.join(home, ".local", "share", "WeChat", "xwechat_files"),
+            os.path.join(home, ".local", "state", "wechat", "xwechat_files"),
             os.path.join(home, "Documents", "xwechat_files"),
         ):
             hit = _locate_account_root(base)
