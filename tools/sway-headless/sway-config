@@ -1,0 +1,12 @@
+# sway headless 会话配置（供 launch-wechat.sh 使用）
+#
+# 关键点：
+# - WLR_BACKENDS=headless 下输出名为 HEADLESS-1，无真实显卡也能跑（pixman 软渲染）；
+# - 开启无障碍桥接环境变量在 launch 脚本里设置（QT_ACCESSIBILITY 等），
+#   这样 AT-SPI2（wechatauto.linux_ui）能读到微信的控件树；
+# - 不装 bar / 壁纸，保持最小会话。
+
+output HEADLESS-1 mode 1280x800 position 0,0
+default_orientation auto
+
+# 不需要任何自启任务；微信由 launch-wechat.sh 在会话就绪后拉起

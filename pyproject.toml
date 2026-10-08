@@ -14,8 +14,10 @@ keywords = ["wechat", "weixin", "wechat4", "wxauto", "wechatauto", "uiautomation
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
     "Natural Language :: Chinese (Simplified)",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -25,18 +27,15 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "uiautomation>=2.0.18",
-    "pywin32>=305",
+    # 全部为跨平台依赖；Windows 专属依赖（uiautomation/pywin32/winsdk 等）
+    # 移入 [project.optional-dependencies] windows，Linux 上 pip install 即可成功。
     "pyperclip>=1.8.2",
     "Pillow>=9.0.0",
     "psutil>=5.9.0",
     "colorama>=0.4.6",
     "cryptography>=41.0.0",
-    "winsdk>=1.0.0b10",
     "imageio-ffmpeg>=0.4.9",
     "zstandard>=0.19.0",
-    "pyautogui>=0.9.53",
-    "opencv-python>=4.8.0",
 ]
 
 [project.scripts]
@@ -44,6 +43,18 @@ dependencies = [
 wechatauto = "wechatauto.cli:main"
 
 [project.optional-dependencies]
+# Windows 全功能（UIA 驱动 + 剪贴板 + OCR）。Linux 读库路线不需要装。
+windows = [
+    "uiautomation>=2.0.18",
+    "pywin32>=305",
+    "pyautogui>=0.9.53",
+    "opencv-python>=4.8.0",
+    "winsdk>=1.0.0b10",
+]
+# Linux：纯读库无需任何额外 pip 包；UI 自动化后端依赖的是系统包
+# （at-spi2-core、sway、grim、wtype/ydotool 等），无法经 pip 分发，
+# 安装说明见 docs/linux-support.md。
+linux = []
 moments = ["pyautogui>=0.9.53", "opencv-python>=4.8.0"]
 guia = ["winsdk>=1.0.0b10", "pypinyin>=0.48.0"]
 

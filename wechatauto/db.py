@@ -40,6 +40,10 @@ from typing import Dict, List, Optional, Tuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from wechatauto.logger import wxlog
 
+# 平台开关：Windows 走原有 kernel32/UIA 全功能路径；Linux 走 linux_key 的
+# /proc 内存扫描读库路径（见 wechatauto/linux_key.py），UI 发送走 linux_ui。
+IS_WINDOWS = sys.platform == "win32"
+
 PAGE_SZ = 4096
 RESERVE_SZ = 80  # IV(16) + HMAC(64)
 STAMP_VERSION = 3  # v3: stamp 内 mtime 改用 %r 完整精度（%f 只留 6 位小数，与 Windows 7 位小数比较恒不等→每秒重建缓存→磁盘 50MB/s 读+写）
@@ -110,17 +114,20 @@ class _MODULEENTRY32W(ctypes.Structure):
     ]
 
 
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_k32.OpenProcess.restype = wintypes.HANDLE
-_k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-_k32.VirtualQueryEx.argtypes = [
-    wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(_MBI), ctypes.c_size_t,
-]
-_k32.VirtualQueryEx.restype = ctypes.c_size_t
-_k32.ReadProcessMemory.argtypes = [
-    wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-    ctypes.POINTER(ctypes.c_size_t),
-]
+if IS_WINDOWS:
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.OpenProcess.restype = wintypes.HANDLE
+    _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _k32.VirtualQueryEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(_MBI), ctypes.c_size_t,
+    ]
+    _k32.VirtualQueryEx.restype = ctypes.c_size_t
+    _k32.ReadProcessMemory.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+else:
+    _k32 = None  # Linux 上不加载 kernel32；读内存走 linux_key（/proc/<pid>/mem）
 
 
 def _md5_hex(data: bytes) -> str:
@@ -187,6 +194,8 @@ def _sqlite_text_factory(data: bytes):
 # ---------------------------------------------------------------------------
 def _find_weixin_module(pid: int) -> Optional[Tuple[int, int, str]]:
     """返回 (模块基址, 模块大小, 路径); weixin.dll 为微信 4.x 主模块"""
+    if not IS_WINDOWS:
+        return None
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
     k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -292,6 +301,8 @@ def extract_master_key_from_cfg(pid: int) -> Optional[Tuple[str, int, str]]:
     密文 XOR DLL movabs 材料得主密钥。锚点(CFG_PTR_BACK/CFG_OFFSET/特征码)
     每版本重采; 提取失败返回 None。
     """
+    if not IS_WINDOWS:
+        return None
     base, mod_size, dll_path = _find_weixin_module(pid) or (0, 0, "")
     if not base or not dll_path or mod_size <= 0 or mod_size >= 0x40000000:
         return None
@@ -840,7 +851,12 @@ class WeChatDB:
 
         遍历微信进程调 extract_master_key_from_cfg; 主密钥可离线派生全部库。
         微信未运行或锚点漂移(版本变更)时返回 None, 由调用方回退。
+        Linux：cfg 指针链是 Windows 版 weixin.dll 的逆向锚点，对 Linux 客户端
+        无意义，直接返回 None（库密钥由 linux_key 直接扫描验证得出，
+        不依赖主密钥）。
         """
+        if not IS_WINDOWS:
+            return None
         pids = self._find_weixin_pids()
         for pid in pids:
             got = extract_master_key_from_cfg(pid)
@@ -868,7 +884,16 @@ class WeChatDB:
         raise KeyError(rel)
 
     def extract_keys(self) -> Dict[str, bytes]:
-        """从 Weixin.exe 进程内存扫描 Config.Cipher 对象，提取各库密钥"""
+        """从微信进程内存提取各库密钥。
+
+        Windows：扫描 Config.Cipher 对象（原路径）。
+        Linux：调用 wechatauto.linux_key 做 /proc/<pid>/mem 扫描 + 页1 HMAC
+        强校验（需要 root；密钥为账号绑定静态值，root 只需成功跑一次，
+        结果缓存进 keys.json 后续读取不再需要任何权限）。
+        """
+        if not IS_WINDOWS:
+            from wechatauto.linux_key import extract_keys_for_dbs
+            return extract_keys_for_dbs(self._db_files)
         pids = self._find_weixin_pids()
         if not pids:
             raise RuntimeError("未检测到 Weixin.exe，请先登录微信再运行")
@@ -955,6 +980,11 @@ class WeChatDB:
 
     def _all_key_candidates(self) -> set:
         """一次内存扫描，收集所有候选密钥材料（与账号无关）。"""
+        if not IS_WINDOWS:
+            # Linux：直接按密码学校验返回 {(key, salt)} 形式的确定密钥集合
+            from wechatauto.linux_key import collect_candidates_for_dbs
+            found = collect_candidates_for_dbs(self._db_files)
+            return {(k, None) for k in found.values()}
         seen: set = set()
         out: set = set()
         for pid in self._find_weixin_pids():
@@ -1052,6 +1082,9 @@ class WeChatDB:
         return True
 
     def _find_weixin_pids(self) -> List[int]:
+        if not IS_WINDOWS:
+            from wechatauto.linux_key import find_wechat_pids
+            return find_wechat_pids()
         import subprocess
 
         try:
@@ -1193,15 +1226,20 @@ class WeChatDB:
 
         TEMP 被清理/重置后密钥缓存就没了，而微信更新**不会重新加密 DB**，
         所以一份有效的缓存本可跨更新长期复用。优先用环境变量
-        ``WECHATAUTO_KEYS_DIR``，否则用 ``%LOCALAPPDATA%\\wechatauto_keys``。
+        ``WECHATAUTO_KEYS_DIR``，否则用 ``%LOCALAPPDATA%\\wechatauto_keys``
+        （Linux: ``~/.local/share/wechatauto_keys``）。
         """
         dirs = []
         env = os.environ.get("WECHATAUTO_KEYS_DIR")
         if env:
             dirs.append(env)
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("USERPROFILE")
-        if base:
-            dirs.append(os.path.join(base, "wechatauto_keys"))
+        if IS_WINDOWS:
+            base = os.environ.get("LOCALAPPDATA") or os.environ.get("USERPROFILE")
+            if base:
+                dirs.append(os.path.join(base, "wechatauto_keys"))
+        else:
+            dirs.append(os.path.join(
+                os.path.expanduser("~"), ".local", "share", "wechatauto_keys"))
         return dirs
 
     def _stable_key_file(self, account: Optional[str] = None) -> Optional[str]:
@@ -3026,7 +3064,8 @@ def _extract_path_from_config(content: str) -> Optional[str]:
     """从配置内容中提取数据目录路径，兼容 JSON 字段 / 纯路径 / 任意文本。
 
     微信 4.x 不同版本配置文件格式不一：有的是纯路径，有的是 JSON
-    （字段如 dataDir / fileSavePath）。这里统一兜底提取第一个 Windows 路径。
+    （字段如 dataDir / fileSavePath）。这里统一兜底提取第一个路径
+    （Windows 盘符路径或 POSIX 绝对路径）。
     """
     content = (content or "").strip().lstrip("\ufeff")
     if not content:
@@ -3041,12 +3080,16 @@ def _extract_path_from_config(content: str) -> Optional[str]:
                     return v.strip()
         elif isinstance(obj, list):
             for item in obj:
-                if isinstance(item, str) and re.match(r"^[A-Za-z]:[\\/]", item):
+                if isinstance(item, str) and (
+                    re.match(r"^[A-Za-z]:[\\/]", item) or item.startswith("/")
+                ):
                     return item
     except Exception:
         pass
     if re.match(r"^[A-Za-z]:[\\/]", content):
         return content
+    if content.startswith("/"):
+        return content.split()[0]
     m = re.search(r"[A-Za-z]:[\\/][^\s\x00-\x1f\"']+", content)
     if m:
         return _abs_root(m.group(0))        # 不能用 rstrip：'d:\\' 会变成 'd:'（盘符相对）
@@ -3056,6 +3099,16 @@ def _extract_path_from_config(content: str) -> Optional[str]:
 def _config_candidates() -> List[str]:
     """可能的微信 4.x 配置目录（按新旧版本与 32/64 位安装差异）。"""
     out = []
+    if not IS_WINDOWS:
+        # Linux 客户端的配置目录尚未形成稳定约定，先收常规位置：
+        # auto_detect_db_dir 对找不到配置的情形本来就能落到默认目录探测。
+        home = os.path.expanduser("~")
+        out.extend([
+            os.path.join(home, ".config", "wechat"),
+            os.path.join(home, ".config", "WeChat"),
+            os.path.join(home, ".config", "tencent", "xwechat"),
+        ])
+        return out
     for env in ("APPDATA", "LOCALAPPDATA"):
         base = os.environ.get(env, "")
         if base:
@@ -3069,6 +3122,8 @@ def _config_candidates() -> List[str]:
 
 def _registry_data_dirs() -> List[str]:
     """从注册表读取可能指向数据目录的值（用户自定义保存位置时补充来源）。"""
+    if not IS_WINDOWS:
+        return []
     import winreg
     dirs = []
     for hive, sub in (
@@ -3151,9 +3206,22 @@ def auto_detect_db_dir() -> Optional[str]:
 
     探测顺序：
       1. 微信配置文件（%APPDATA%/%LOCALAPPDATA%，支持 JSON/纯路径/任意文本）；
-      2. 注册表；
-      3. 常见默认目录（Documents / 用户主目录）。
+      2. 注册表（仅 Windows）；
+      3. 常见默认目录（Documents / 用户主目录 / Linux 客户端数据目录）。
     """
+    # 0) Linux 官方客户端的固定数据目录（优先，布局与 Windows 版一致）
+    if not IS_WINDOWS:
+        home = os.path.expanduser("~")
+        for base in (
+            os.path.join(home, "xwechat_files"),
+            os.path.join(home, ".xwechat_files"),
+            os.path.join(home, ".var", "app", "com.tencent.WeChat", "xwechat_files"),
+            os.path.join(home, ".local", "share", "WeChat", "xwechat_files"),
+            os.path.join(home, "Documents", "xwechat_files"),
+        ):
+            hit = _locate_account_root(base)
+            if hit:
+                return hit
     # 1) 配置文件
     for cfg_dir in _config_candidates():
         if not os.path.isdir(cfg_dir):
