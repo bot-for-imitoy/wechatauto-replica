@@ -199,12 +199,16 @@ def master_pool(cands, page1_0, workers, label):
 # ---------------------------------------------------------------------------
 # H4: salt 锚定（首选）
 # ---------------------------------------------------------------------------
-def scan_salt_anchored(chunks, page1s, workers, ctx_radius=0x8000):
+def scan_salt_anchored(chunks, page1s, workers, ctx_radius=0x8000,
+                       master: bool = True):
     """定位库 salt / mac_salt 在内存中的位置 → 上下文窗口内候选双路验证。
 
     cipher 上下文里存有 salt（PBKDF2 用）与 mac_salt（页 HMAC 用），
     找到 salt 就等于找到了放密钥的结构体。
+    master=False 时跳过 路 2（PBKDF2×256000 每窗口数分钟，真机已证
+    零命中），只做瞬时裸密钥验证。
     """
+    page1_by_rel = dict(page1s)
     salts = {}
     for rel, page1 in page1s:
         salt = page1[:16]
@@ -228,16 +232,18 @@ def scan_salt_anchored(chunks, page1s, workers, ctx_radius=0x8000):
                     window = buf[lo:hi]
                     log(f"  [H4] {rel} salt 命中 @ {hex(start + pos)}"
                         f"（{'anon' if not path else path}），窗口 {len(window) // 1024}KB")
-                    # 路 1：直接当逐库裸密钥（瞬时）
+                    own = [(rel, page1_by_rel[rel])]
+                    # 路 1：直接当逐库裸密钥（瞬时，只验命中 salt 的那个库）
                     mv = memoryview(window)
                     for off in range(0, max(0, len(window) - 32)):
                         cand = bytes(mv[off:off + 32])
-                        for hit in verify_direct(cand, page1s):
+                        for hit in verify_direct(cand, own):
                             if hit not in direct_hits:
                                 direct_hits[hit] = cand
                                 log(f"    !! H4 逐库裸密钥命中 {hit}: {cand.hex()}")
-                    # 路 2：当主密钥派生验证（PBKDF2×256000）
-                    if not direct_hits:
+                    # 路 2：当主密钥派生验证（PBKDF2×256000，慢；主密钥
+                    # 账号级唯一，统一用第一个库的 salt 派生验证即可）
+                    if master and not direct_hits:
                         cands = [bytes(mv[o:o + 32])
                                  for o in range(0, max(0, len(window) - 32))]
                         cands = [c for c in cands if len(set(c)) >= 15]
@@ -472,7 +478,8 @@ def main():
     ap.add_argument("--stride", type=int, default=8, help="H1 全内存步长（默认 8）")
     ap.add_argument("--skip-h1", action="store_true", help="跳过 H1/H1b 暴力直扫")
     ap.add_argument("--skip-salt", action="store_true", help="跳过 H4 salt 锚定")
-    ap.add_argument("--skip-master", action="store_true", help="跳过所有主密钥假设")
+    ap.add_argument("--skip-master", action="store_true",
+                    help="跳过所有主密钥派生验证（H4 路2 + H3；真机已证零命中且慢）")
     ap.add_argument("--skip-aes", action="store_true", help="跳过 H5 AES 扩展表反推")
     args = ap.parse_args()
 
@@ -522,7 +529,8 @@ def main():
 
         if not args.skip_salt:
             head(f"进程 {pid}: H4 salt 锚定（cipher 上下文定位，首选）")
-            direct, masters = scan_salt_anchored(chunks, page1s, workers)
+            direct, masters = scan_salt_anchored(chunks, page1s, workers,
+                                                 master=not args.skip_master)
             if direct:
                 found.append(("H4-direct", {r: k.hex() for r, k in direct.items()}))
             if masters:
