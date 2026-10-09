@@ -200,6 +200,7 @@ def master_pool(cands, page1_0, workers, label):
 # H4: salt 锚定（首选）
 # ---------------------------------------------------------------------------
 _CTX_DUMP = None   # salt 上下文原始转储文件句柄（main 里按参数打开）
+H5_KEYS = []       # H5 反推的全部候选密钥（(布局, key)），供 H6 使用
 
 
 def scan_salt_anchored(chunks, page1s, workers, ctx_radius=0x8000,
@@ -425,6 +426,97 @@ def verify_key_sweep(key: bytes, page1: bytes):
     return None
 
 
+def verify_hmac_params(mk: bytes, page1: bytes):
+    """已知 mac_key 时穷举页 1 HMAC 参数（无 KDF，~10µs/组合）。"""
+    if len(page1) < PAGE_SZ:
+        return None
+    for hash_name in ("sha512", "sha256"):
+        hlen = 64 if hash_name == "sha512" else 32
+        stored = page1[PAGE_SZ - hlen: PAGE_SZ]
+        for pageno_mode in ("le", "be", "none"):
+            for reserve in (80, 48, 64, 96, 112, 128, 32, 16):
+                hmac_data = page1[16: PAGE_SZ - reserve + 16]
+                hm = hmac_mod.new(mk, hmac_data, getattr(hashlib, hash_name))
+                if pageno_mode == "le":
+                    hm.update(struct.pack("<I", 1))
+                elif pageno_mode == "be":
+                    hm.update(struct.pack(">I", 1))
+                if hm.digest() == stored:
+                    return (f"{hash_name}/pageno-{pageno_mode}/reserve{reserve}")
+    return None
+
+
+def scan_mackey_windows(chunks, page1s, keys):
+    """H6：H5 反推的候选密钥 → 各派生方案的 mac_key → 在 salt 上下文窗口搜。
+
+    SQLCipher 的 cipher 上下文在打开库期间保存派生好的 mac_key；
+    在窗口内命中即确认派生方案，再用已知 mac_key 穷举 HMAC 参数。
+    mac_key 用快 KDF（2/1/4 迭代）——页密钥本身已是 KDF 产物，不会再
+    对它做 256000 迭代派生；另含 raw-key 直接当 mac_key 的平凡方案。
+    mk 列表按 salt 缓存（同一库的多个窗口复用）。
+    """
+    page1_by_rel = dict(page1s)
+    salts = {}
+    for rel, page1 in page1s:
+        salts[page1[:16]] = rel
+        salts[bytes(b ^ 0x3A for b in page1[:16])] = rel
+
+    mk_cache = {}   # salt(bytes) -> [(scheme, mk), ...]
+
+    def mks_for(salt: bytes):
+        if salt in mk_cache:
+            return mk_cache[salt]
+        out = [("raw-key", key) for key in keys]
+        for key in keys:
+            for hash_name in ("sha512", "sha256"):
+                for sv_name, sv in (("mac3a", bytes(b ^ 0x3A for b in salt)),
+                                    ("mac00", salt),
+                                    ("salt", bytes(b ^ 0x3A for b in salt)[::-1])):
+                    for iters in (2, 1, 4):
+                        out.append((
+                            f"{hash_name}/{sv_name}/kdf{iters}",
+                            hashlib.pbkdf2_hmac(hash_name, key, sv,
+                                                iters, dklen=32)))
+        mk_cache[salt] = out
+        return out
+
+    seen_ctx = set()
+    found = []
+    for start, buf, path in chunks:
+        for salt, rel in salts.items():
+            pos = 0
+            while True:
+                pos = buf.find(salt, pos)
+                if pos < 0:
+                    break
+                ctx_id = (start + pos) // 0x1000
+                real_pos = pos
+                pos += 1
+                if ctx_id in seen_ctx:
+                    continue
+                seen_ctx.add(ctx_id)
+                lo = max(0, real_pos - 0x8000)
+                hi = min(len(buf), real_pos + 0x8000)
+                window = buf[lo:hi]
+                page1 = page1_by_rel[rel]
+                for scheme, mk in mks_for(salt):
+                    mpos = window.find(mk)
+                    if mpos < 0:
+                        continue
+                    combo = verify_hmac_params(mk, page1)
+                    addr = start + lo + mpos
+                    if combo:
+                        found.append((rel, mk, scheme, combo))
+                        key_hex = mk.hex()
+                        log(f"    !! H6 mac_key 确认 {rel}: 方案 {scheme} "
+                            f"@ {hex(addr)}，mac_key={key_hex}；HMAC {combo}")
+                    else:
+                        log(f"    [H6] mac_key 字节命中 {rel}: 方案 {scheme} "
+                            f"@ {hex(addr)} —— 但页 1 HMAC 参数仍未中"
+                            f"（mac_key 可能用于别处或参数更怪）")
+    return found
+
+
 def scan_aes_schedules(chunks, page1s, chunk_bytes=1 << 26):
     """H5：扫描 AES-256 扩展表并反推原始密钥（双布局）。
 
@@ -488,6 +580,7 @@ def scan_aes_schedules(chunks, page1s, chunk_bytes=1 << 26):
     hits = []
     seen_keys = set()
     stats = {"A": 0, "B": 0}   # 数学有效扩展表数（按布局）
+    H5_KEYS.clear()
     for start, buf, _path in chunks:
         off = 0
         while off < len(buf) - 256:
@@ -514,6 +607,7 @@ def scan_aes_schedules(chunks, page1s, chunk_bytes=1 << 26):
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
+                    H5_KEYS.append((layout, key))
                     for rel, page1 in page1s:
                         combo = verify_key_sweep(key, page1)
                         if combo:
@@ -635,6 +729,15 @@ def main():
             hits = scan_aes_schedules(chunks, page1s)
             if hits:
                 found.append(("H5", {r: k.hex() for r, k in hits}))
+
+        if H5_KEYS and not args.skip_salt:
+            head(f"进程 {pid}: H6 mac_key 上下文搜索（H5 密钥 → 派生方案确认）")
+            h6 = scan_mackey_windows(chunks, page1s, [k for _, k in H5_KEYS])
+            if h6:
+                found.append(("H6", [(r, k.hex(), s, c) for r, k, s, c in h6]))
+            else:
+                log("  [H6] 25 种派生方案 × 全部候选密钥在 70 个 salt 窗口内"
+                    "均未命中 mac_key 字节")
 
         summary[pid] = found
 
