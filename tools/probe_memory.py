@@ -199,6 +199,9 @@ def master_pool(cands, page1_0, workers, label):
 # ---------------------------------------------------------------------------
 # H4: salt 锚定（首选）
 # ---------------------------------------------------------------------------
+_CTX_DUMP = None   # salt 上下文原始转储文件句柄（main 里按参数打开）
+
+
 def scan_salt_anchored(chunks, page1s, workers, ctx_radius=0x8000,
                        master: bool = True):
     """定位库 salt / mac_salt 在内存中的位置 → 上下文窗口内候选双路验证。
@@ -232,6 +235,17 @@ def scan_salt_anchored(chunks, page1s, workers, ctx_radius=0x8000,
                     window = buf[lo:hi]
                     log(f"  [H4] {rel} salt 命中 @ {hex(start + pos)}"
                         f"（{'anon' if not path else path}），窗口 {len(window) // 1024}KB")
+                    if _CTX_DUMP:
+                        try:
+                            dlo = max(0, pos - 512)
+                            data = buf[dlo: pos + 512]
+                            rec = (rel.encode() + b"\x00" +
+                                   struct.pack("<QI", start + pos, pos - dlo) +
+                                   struct.pack("<I", len(data)) + data)
+                            _CTX_DUMP.write(rec)
+                            _CTX_DUMP.flush()
+                        except OSError as exc:
+                            log(f"  [H4] 上下文转储失败: {exc!r}")
                     own = [(rel, page1_by_rel[rel])]
                     # 路 1：直接当逐库裸密钥（瞬时，只验命中 salt 的那个库）
                     mv = memoryview(window)
@@ -375,15 +389,53 @@ def _subword_np(x, rotate: bool):
             _SBOX_NP[b3].astype(np.uint32))
 
 
+def verify_key_sweep(key: bytes, page1: bytes):
+    """多参数组合验证一个候选密钥。
+
+    Windows 版参数（HMAC-SHA512 / mac_salt=salt^0x3A / 快KDF×2 /
+    页号LE / reserve=80）在 Linux 版未必相同；候选密钥昂贵（来自扩展
+    表反推），验证便宜（~10µs/组合），所以全组合扫一遍。
+    返回命中的参数组合描述，全败返回 None。
+    """
+    if len(page1) < PAGE_SZ:
+        return None
+    salt = page1[:16]
+    for xbyte in (0x3A, 0x00):
+        mac_salt = bytes(b ^ xbyte for b in salt)
+        for hash_name in ("sha512", "sha256"):
+            # KDF 哈希跟随 HMAC 哈希（SQLCipher 语义），db._pbkdf2 硬编码
+            # sha512 不能用于 sha256 组合
+            for iters in (2, 1):
+                mac_key = hashlib.pbkdf2_hmac(hash_name, key, mac_salt,
+                                              iters, dklen=32)
+                hlen = 64 if hash_name == "sha512" else 32
+                stored = page1[PAGE_SZ - hlen: PAGE_SZ]
+                for pageno_mode in ("le", "be", "none"):
+                    for reserve in (80, 48, 64, 96):
+                        hmac_data = page1[16: PAGE_SZ - reserve + 16]
+                        hm = hmac_mod.new(mac_key, hmac_data,
+                                          getattr(hashlib, hash_name))
+                        if pageno_mode == "le":
+                            hm.update(struct.pack("<I", 1))
+                        elif pageno_mode == "be":
+                            hm.update(struct.pack(">I", 1))
+                        if hm.digest() == stored:
+                            return (f"{hash_name}/xor{xbyte:02x}/kdf{iters}/"
+                                    f"pageno-{pageno_mode}/reserve{reserve}")
+    return None
+
+
 def scan_aes_schedules(chunks, page1s, chunk_bytes=1 << 26):
-    """H5：扫描 AES-256 扩展表并反推原始密钥。
+    """H5：扫描 AES-256 扩展表并反推原始密钥（双布局）。
 
     AES-256 扩展 60 词（语义域）：W[8i] = W[8i-8] ^ SubWord(RotWord(W[8i-1]))
     ^ Rcon[i]；W[8i+4] = W[8i-4] ^ SubWord(W[8i+3])。
-    检测用 W[j] = W[j-8] ^ SubWord(RotWord(W[j-1])) ^ Rcon1 对全部字偏移
-    stride-1 扫（单关系误报率 2^-32：真表必命中、随机数据几乎不命中），
-    命中处完整验证 14 轮关系，取前 8 词还原密钥（大端字节序），最后页 1
-    HMAC 确认。
+    两种内存布局都扫：
+      A（OpenSSL/BoringSSL）：u32 = GETU32(key bytes)，语义大端值；
+      B（mbedTLS 风格）：u32 = 语义小端值（key 字节直接按 LE 读）。
+    命中处完整验证 14 轮关系后反推密钥，再用 verify_key_sweep 参数全
+    组合验证页 1 HMAC。数学有效但 HMAC 未过的扩展表也会计数上报——
+    那意味着密钥找对了、参数没对。
     """
     try:
         import numpy as np
@@ -403,16 +455,15 @@ def scan_aes_schedules(chunks, page1s, chunk_bytes=1 << 26):
     t_hi = ((_SBOX_NP[idx16 & 0xFF].astype(np.uint32) << np.uint32(16)) |
             (_SBOX_NP[(idx16 >> 8) & 0xFF].astype(np.uint32) << np.uint32(24)))
 
-    def detect(piece):
+    def detect(w):
         """首关系筛选：返回词偏移数组 j（W[j] 为某扩展表第 9 词）。"""
-        w = np.frombuffer(piece, dtype="<u4")
         if len(w) < 69:
-            return w, []
+            return []
         x = w[7:-1]
         rot = (x << np.uint32(8)) | (x >> np.uint32(24))      # RotWord = rotl8
         sub = t_lo[rot & np.uint32(0xFFFF)] | t_hi[rot >> np.uint32(16)]
         match = w[8:] == (w[:-8] ^ sub ^ rcon1)
-        return w, np.nonzero(match)[0]
+        return np.nonzero(match)[0]
 
     def verify(words60):
         """完整验证 60 词扩展表（语义域逐词）。relB 最后一个位置越界不查。"""
@@ -436,30 +487,45 @@ def scan_aes_schedules(chunks, page1s, chunk_bytes=1 << 26):
 
     hits = []
     seen_keys = set()
+    stats = {"A": 0, "B": 0}   # 数学有效扩展表数（按布局）
     for start, buf, _path in chunks:
         off = 0
         while off < len(buf) - 256:
             piece = buf[off:off + chunk_bytes + 256]
-            w, js = detect(piece)
-            for idx in js:
-                j = int(idx) + 8   # match 数组下标 0 对应词偏移 8
-                if j + 52 > len(w):
-                    continue
-                words60 = w[j - 8: j - 8 + 60]
-                if not verify(words60):
-                    continue
-                # 还原密钥：语义字 → 大端字节序
-                key = b"".join(struct.pack(">I", int(x)) for x in words60[:8])
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                for rel, page1 in page1s:
-                    if _verify_enc_key(key, page1):
-                        hits.append((rel, key))
-                        log(f"    !! H5 命中 {rel}: {key.hex()} "
-                            f"@ {hex(start + off + (j - 8) * 4)}")
+            arr = np.frombuffer(piece, dtype="<u4")
+            # 布局 A：原样即语义大端；布局 B：字节交换后为语义大端
+            for layout, w, src in (("A", arr, arr),
+                                   ("B", arr.byteswap(), arr)):
+                for idx in detect(w):
+                    j = int(idx) + 8   # match 数组下标 0 对应词偏移 8
+                    if j + 52 > len(w):
+                        continue
+                    words60 = w[j - 8: j - 8 + 60]
+                    if not verify(words60):
+                        continue
+                    stats[layout] += 1
+                    base = start + off + (j - 8) * 4
+                    if layout == "A":   # 语义大端 → key = pack(">I")
+                        key = b"".join(struct.pack(">I", int(x))
+                                       for x in words60[:8])
+                    else:               # 内存 u32 本身是语义小端 → pack("<I")
+                        key = b"".join(struct.pack("<I", int(x))
+                                       for x in src[j - 8: j - 8 + 8])
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    for rel, page1 in page1s:
+                        combo = verify_key_sweep(key, page1)
+                        if combo:
+                            hits.append((rel, key))
+                            log(f"    !! H5 命中 {rel}: {key.hex()} "
+                                f"@ {hex(base)}（布局{layout}，{combo}）")
+                    if not any(h[1] == key for h in hits):
+                        log(f"    [H5] 数学有效扩展表（布局{layout}）@ {hex(base)}"
+                            f" key={key.hex()} —— HMAC 全参数组合未过")
             off += chunk_bytes
-    log(f"  [H5] 完成，命中 {len(hits)}")
+    log(f"  [H5] 完成：数学有效扩展表 A={stats['A']} B={stats['B']}，"
+        f"最终命中 {len(hits)}")
     return hits
 
 
@@ -481,6 +547,8 @@ def main():
     ap.add_argument("--skip-master", action="store_true",
                     help="跳过所有主密钥派生验证（H4 路2 + H3；真机已证零命中且慢）")
     ap.add_argument("--skip-aes", action="store_true", help="跳过 H5 AES 扩展表反推")
+    ap.add_argument("--ctx-dump", default="wechat-ctx-dump.bin",
+                    help="H4 salt 上下文 ±512B 原始转储文件（空字符串关闭）")
     args = ap.parse_args()
 
     head("步骤 1/4: 库文件状态（H0）")
@@ -500,6 +568,14 @@ def main():
     for rel, path, _ in usable:
         with open(path, "rb") as f:
             page1s.append((rel, f.read(PAGE_SZ)))
+
+    global _CTX_DUMP
+    if args.ctx_dump:
+        try:
+            _CTX_DUMP = open(args.ctx_dump, "wb")
+            log(f"salt 上下文转储 -> {args.ctx_dump}")
+        except OSError as exc:
+            log(f"!! 上下文转储文件打不开（{exc!r}），继续不转储")
 
     head("步骤 2/4: 进程定位")
     wechat_pids = find_wechat_pids()
