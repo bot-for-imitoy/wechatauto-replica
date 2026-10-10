@@ -84,6 +84,12 @@ def load_keys(args) -> list:
             k = k.strip().lower()
             if len(k) == 64 and re.fullmatch(r"[0-9a-f]{64}", k):
                 keys.append(k)
+    if args.keys_file and Path(args.keys_file).exists():
+        text = Path(args.keys_file).read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(r"\b([0-9a-fA-F]{64})\b", text):
+            k = m.group(1).lower()
+            if k not in keys:
+                keys.append(k)
     if args.log and Path(args.log).exists():
         text = Path(args.log).read_text(encoding="utf-8", errors="replace")
         for m in re.finditer(r"\bkey=([0-9a-fA-F]{64})\b", text):
@@ -183,6 +189,7 @@ def main():
         "~/.local/state/wechat/xwechat_files"))
     ap.add_argument("--log", default="log.log")
     ap.add_argument("--keys", default="")
+    ap.add_argument("--keys-file", default=str(Path(__file__).with_name("keys_round5.txt")))
     ap.add_argument("--reserves", default=",".join(map(str, DEFAULT_RESERVES)))
     ap.add_argument("--page-size", type=int, default=PAGE_SZ_DEFAULT)
     ap.add_argument("--selftest", action="store_true")
