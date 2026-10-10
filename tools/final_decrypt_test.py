@@ -118,6 +118,13 @@ def plausible_sqlite_pt(pt: bytes):
     return None
 
 
+def plausible_full_page(pt: bytes):
+    """整页加密变体：明文应直接以完整 SQLite 头开始。"""
+    if len(pt) >= 16 and pt[:16] == SQLITE_HEADER_MAGIC:
+        return "sqlite-magic(整页加密变体)"
+    return None
+
+
 def try_page1(db_path: Path, key_bytes: bytes, reserves, page_sz: int):
     try:
         with open(db_path, "rb") as f:
@@ -131,27 +138,31 @@ def try_page1(db_path: Path, key_bytes: bytes, reserves, page_sz: int):
         data_end = page_sz - reserve
         if data_end <= 16:
             continue
-        ct = page[16:data_end]
-        if len(ct) % 16:
-            continue
         iv_cands = [
             page[data_end:data_end + 16],  # SQLCipher 标准：IV 在 reserve 开头
             page[page_sz - 16:],           # 备选：页尾
             salt,                          # 备选：IV=salt
             b"\x00" * 16,                  # 备选：零 IV
         ]
-        seen_iv = set()
-        for iv in iv_cands:
-            if iv in seen_iv:
+        # 区域变体 1：页 1 前 16 字节为 salt（明文），密文从 16 起
+        # 区域变体 2：整页加密（salt 存在页外/文件头别处），明文应含完整 SQLite 头
+        for region, checker in ((16, plausible_sqlite_pt),
+                                (0, plausible_full_page)):
+            ct = page[region:data_end]
+            if len(ct) % 16:
                 continue
-            seen_iv.add(iv)
-            try:
-                pt = _cbc_decrypt(key_bytes, iv, ct)
-            except Exception:
-                continue
-            reason = plausible_sqlite_pt(pt)
-            if reason:
-                return (reserve, iv, pt, reason)
+            seen_iv = set()
+            for iv in iv_cands:
+                if iv in seen_iv:
+                    continue
+                seen_iv.add(iv)
+                try:
+                    pt = _cbc_decrypt(key_bytes, iv, ct)
+                except Exception:
+                    continue
+                reason = checker(pt)
+                if reason:
+                    return (reserve, iv, pt, reason)
     return None
 
 
@@ -192,6 +203,8 @@ def main():
     ap.add_argument("--keys-file", default=str(Path(__file__).with_name("keys_round5.txt")))
     ap.add_argument("--reserves", default=",".join(map(str, DEFAULT_RESERVES)))
     ap.add_argument("--page-size", type=int, default=PAGE_SZ_DEFAULT)
+    ap.add_argument("--kdf-iterations", default="256000,4096,1",
+                    help="主密钥→页密钥的 PBKDF2 迭代数候选（逗号分隔）")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -203,6 +216,8 @@ def main():
         sys.exit(2)
 
     reserves = sorted({int(x) for x in args.reserves.split(",") if x.strip()})
+    kdf_iters = sorted({int(x) for x in args.kdf_iterations.split(",") if x.strip()})
+    args.kdf_iterations = kdf_iters
     keys = load_keys(args)
     print(f"候选密钥 {len(keys)} 个（来自 log/手工指定，已剔除人工测试常量）")
     dbs = collect_db_files(Path(args.db_dir).expanduser())
@@ -211,22 +226,41 @@ def main():
 
     hits = 0
     tried = 0
+    pbkdf2_count = 0
     for label, dbp in dbs:
+        try:
+            with open(dbp, "rb") as f:
+                db_salt = f.read(16)
+        except OSError:
+            continue
+        if len(db_salt) < 16:
+            continue
         for kh in keys:
             tried += 1
-            r = try_page1(dbp, bytes.fromhex(kh), reserves, args.page_size)
-            if r:
-                reserve, iv, pt, reason = r
-                hits += 1
-                print(f"!! 命中 [{label}]")
-                print(f"   key = {kh}")
-                print(f"   reserve={reserve} iv={iv.hex()} 依据={reason}")
-                print(f"   明文头 48 字节: {pt[:48].hex()}")
+            raw = bytes.fromhex(kh)
+            # 候选页密钥：路径1=内存密钥即页密钥；路径2=PBKDF2(主密钥,库salt) 派生
+            candidates = [("direct", raw)]
+            for it in args.kdf_iterations:
+                if it > 0:
+                    candidates.append((
+                        f"PBKDF2-SHA512({it}轮,盐=库salt)",
+                        hashlib.pbkdf2_hmac("sha512", raw, db_salt, it, dklen=32)))
+                    pbkdf2_count += 1
+            for how, page_key in candidates:
+                r = try_page1(dbp, page_key, reserves, args.page_size)
+                if r:
+                    reserve, iv, pt, reason = r
+                    hits += 1
+                    print(f"!! 命中 [{label}]")
+                    print(f"   内存密钥 = {kh}")
+                    print(f"   页密钥 = {page_key.hex()}（{how}）")
+                    print(f"   reserve={reserve} iv={iv.hex()} 依据={reason}")
+                    print(f"   明文头 48 字节: {pt[:48].hex()}")
+                    break
     print("=" * 62)
-    print(f"共尝试 {tried} 组合，命中 {hits}")
+    print(f"共尝试 {tried} 密钥×库组合（含 {pbkdf2_count} 次 PBKDF2 派生），命中 {hits}")
     if hits:
-        print("密钥已确认！用该 key 直接以 SQLCipher 参数解密即可；"
-              "若需 HMAC 参数可再围绕已确认 key 反推。")
+        print("密钥已确认！用上面输出的页密钥以 SQLCipher 参数解密即可。")
     else:
         print("全部未命中——密钥仍可能正确但加密格式超出网格（考虑 IV 位置/加密范围差异）。")
 
